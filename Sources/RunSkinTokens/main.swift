@@ -666,11 +666,61 @@ case "--template-rig":
         print("[tpl] wrote \(outPath) (\(rigged.count) bytes)")
     } catch { err("[tpl] FAIL: \(error)"); exit(1) }
 
+case "--quant-spike":
+    // Weight-quant / decoder speed spike. Same mesh, same deterministic beam search, one run per
+    // variant (weights loaded once); times the whole rig + the generation phase per token and writes
+    // each variant's rigged GLB for an offline quality diff against the first (baseline) variant.
+    //   swift run -c release RunSkinTokens --quant-spike <conv> <mesh.glb> --out <dir>
+    //       [--route-b] [--variants castPerStep,fp32,int8,int4,fp32+sdpa,...]
+    // List a variant twice to re-measure it warm (the first run of a process pays shader compile).
+    let conv = requireArg(1, "<converted-dir>")
+    let glb  = requireArg(2, "<mesh.glb>")
+    func optQ(_ n: String) -> String? { args.firstIndex(of: n).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    let outDir = optQ("--out") ?? FileManager.default.currentDirectoryPath
+    let routeB = args.contains("--route-b")
+    let variantSpecs = (optQ("--variants") ?? "castPerStep,fp32,int8,int4").split(separator: ",").map(String.init)
+    func parse(_ spec: String) -> Qwen3.GenOptions? {
+        let parts = spec.split(separator: "+").map(String.init)
+        guard let wm = Qwen3.GenOptions.WeightMode(rawValue: parts[0]) else { return nil }
+        return Qwen3.GenOptions(weights: wm, fusedAttention: parts.dropFirst().contains("sdpa"))
+    }
+    do {
+        let w = try Weights.load((conv as NSString).appendingPathComponent("tokenrig.safetensors"))
+        for (_, v) in w.prefix(4) { eval(v.sum()) }
+        let glbData = try Data(contentsOf: URL(fileURLWithPath: glb))
+        try FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        var seen: [String: Int] = [:]
+        print("variant\trun\ttotal_s\tgen_s\tsteps\tms_per_step\tms_step_q1\tms_step_q4\tpeak_GB\tout")
+        for spec in variantSpecs {
+            guard let opts = parse(spec) else { err("[spike] bad variant \(spec)"); exit(2) }
+            let run = (seen[spec] ?? 0) + 1; seen[spec] = run
+            MLX.Memory.clearCache(); MLX.GPU.resetPeakMemory()
+            var stamps: [Date] = []
+            let t0 = Date()
+            let params = SkinTokensPipeline.Params(gen: opts)
+            let out = try SkinTokensPipeline.rig(glbData: glbData, skinOnly: routeB, cls: routeB ? "vroid" : nil,
+                                                 weights: w, params: params, progress: { _ in stamps.append(Date()) })
+            let total = Date().timeIntervalSince(t0)
+            let path = (outDir as NSString).appendingPathComponent("\(spec)_r\(run).glb")
+            try out.write(to: URL(fileURLWithPath: path))
+            let steps = stamps.count
+            let gen = steps > 1 ? stamps.last!.timeIntervalSince(stamps.first!) : 0
+            func ms(_ a: Int, _ b: Int) -> Double {
+                guard b > a, b < steps else { return 0 }
+                return stamps[b].timeIntervalSince(stamps[a]) * 1000 / Double(b - a)
+            }
+            let q = max(1, steps / 4)
+            print(String(format: "%@\t%d\t%.1f\t%.1f\t%d\t%.1f\t%.1f\t%.1f\t%.2f\t%@", spec, run, total, gen, steps,
+                         ms(0, steps - 1), ms(0, q), ms(steps - 1 - q, steps - 1),
+                         Double(MLX.Memory.peakMemory) / 1e9, path))
+        }
+    } catch { err("[spike] FAIL: \(error)"); exit(1) }
+
 case "--measure":
     // Footprint harness (memory-harness.md): resident weights floor (post-load) + peak activation
     // (transient scratch during a full run, on the GPU stream = production). Feeds the manifest's
     // split QuantFootprint. Run detached; auto (default) or --route-b (heavier VRM 141-joint envelope).
-    //   swift run -c release RunSkinTokens --measure <conv> <mesh.glb> [--route-b] [--cls vroid]
+    //   swift run -c release RunSkinTokens --measure <conv> <mesh.glb> [--route-b] [--cls vroid] [--quant int8]
     let conv = requireArg(1, "<converted-dir>")
     let glb  = requireArg(2, "<mesh.glb>")
     let tokenrig = (conv as NSString).appendingPathComponent("tokenrig.safetensors")
@@ -679,7 +729,9 @@ case "--measure":
     func mb(_ b: Int) -> String { String(format: "%.0f MB", Double(b) / 1e6) }
     do {
         err("[mem] loading weights (GPU stream)")
-        let w = try Weights.load(tokenrig)
+        var w = try Weights.load(tokenrig)
+        let int8M = (args.firstIndex(of: "--quant").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }) == "int8"
+        if int8M { Qwen3.prequantize(&w, bits: 8); MLX.Memory.clearCache() }
         // Touch the weights on the GPU stream so they're resident where inference runs.
         for (_, v) in w.prefix(4) { eval(v.sum()) }
         let residentAfterLoad = MLX.Memory.activeMemory
@@ -687,13 +739,15 @@ case "--measure":
         let glbData = try Data(contentsOf: URL(fileURLWithPath: glb))
         err("[mem] resident post-load=\(mb(residentAfterLoad)) — running \(routeB ? "route-b" : "auto")")
         let t0 = Date()
-        _ = try SkinTokensPipeline.rig(glbData: glbData, skinOnly: routeB, cls: clsM, weights: w, progress: { s in
+        var mParams = SkinTokensPipeline.Params()
+        if int8M { mParams.gen.weights = .int8 }
+        _ = try SkinTokensPipeline.rig(glbData: glbData, skinOnly: routeB, cls: clsM, weights: w, params: mParams, progress: { s in
             if s % 100 == 0 { err("[mem]   step \(s) active=\(mb(MLX.Memory.activeMemory)) peak=\(mb(MLX.Memory.peakMemory))") }
         })
         let dt = Date().timeIntervalSince(t0)
         let peak = MLX.Memory.peakMemory
         let activation = max(0, peak - residentAfterLoad)
-        print("[mem] ===== FOOTPRINT (\(routeB ? "skinOnly/VRM" : "auto")) =====")
+        print("[mem] ===== FOOTPRINT (\(routeB ? "skinOnly/VRM" : "auto"), \(int8M ? "int8" : "bf16")) =====")
         print("[mem] resident (weights floor, post-load) = \(mb(residentAfterLoad)) [\(residentAfterLoad) B]")
         print("[mem] peak (during run)                    = \(mb(peak)) [\(peak) B]")
         print("[mem] peakActivation (peak − resident)     = \(mb(activation)) [\(activation) B]")

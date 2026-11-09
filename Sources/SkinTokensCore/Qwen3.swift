@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXFast
 
 /// S2 — TokenRig transformer forward (`transformer.*`). A stock Qwen3-0.6B backbone with an UN-TIED
 /// rig-vocab head (33036), run on `inputs_embeds` (512-token mesh soft prefix + token embeds).
@@ -23,6 +24,58 @@ public enum Qwen3 {
         /// bf16-rounding is within the already-non-reproducible generation envelope.
         public var kvDtype: DType = .float32
         public init() {}
+    }
+
+    /// Generation-only decoder options (the parity path `Qwen3.forward` never sees these). The default
+    /// is the original behavior; the other modes exist for the speed/quality spike (`--quant-spike`).
+    public struct GenOptions: Sendable, CustomStringConvertible {
+        public enum WeightMode: String, Sendable, CaseIterable {
+            /// Original: weights stay bf16, upcast to fp32 inside EVERY step's matmul.
+            case castPerStep
+            /// Upcast once at decoder init (fp32 resident copy of the backbone, ~1.8 GB).
+            case fp32
+            /// Affine int8 / int4, group 64, quantized from fp32 — `quantizedMatmul` on fp32 activations.
+            case int8, int4
+        }
+        public var weights: WeightMode = .castPerStep
+        /// `MLXFast.scaledDotProductAttention` with native GQA (no repeatKV copy) instead of the
+        /// explicit fp32 softmax(QKᵀ)V. Compute stays fp32.
+        public var fusedAttention = false
+        public init(weights: WeightMode = .castPerStep, fusedAttention: Bool = false) {
+            self.weights = weights; self.fusedAttention = fusedAttention
+        }
+        public var description: String { weights.rawValue + (fusedAttention ? "+sdpa" : "") }
+    }
+
+    /// Every backbone projection the generation decoder multiplies by (28 layers × 7 + the rig head).
+    /// `embed_tokens` and the norms are NOT included — they stay in their loaded dtype.
+    public static func projectionNames(config c: Config = Config(), prefix p: String = "transformer") -> [String] {
+        var names = ["\(p).lm_head.weight"]
+        for i in 0..<c.layers {
+            let lp = "\(p).model.layers.\(i)"
+            names += ["q_proj", "k_proj", "v_proj", "o_proj"].map { "\(lp).self_attn.\($0).weight" }
+            names += ["gate_proj", "up_proj", "down_proj"].map { "\(lp).mlp.\($0).weight" }
+        }
+        return names
+    }
+
+    /// Suffixes for a pre-quantized projection stored in the weights dict.
+    static let qWq = ".q.wq", qScales = ".q.scales", qBiases = ".q.biases"
+
+    /// Quantize the backbone projections IN PLACE (affine, group 64, from fp32) and DROP the originals,
+    /// so the dense copy is freed — the load-time path behind the package's `.int8` tier. After this
+    /// the dict only serves a decoder built with the matching `GenOptions.weights` (`.int8`/`.int4`);
+    /// the fp32 parity path (`Qwen3.forward`) needs the originals and must not be given it.
+    public static func prequantize(_ w: inout [String: MLXArray], bits: Int,
+                                   config c: Config = Config(), prefix p: String = "transformer") {
+        for n in projectionNames(config: c, prefix: p) {
+            guard let dense = w[n] else { continue }
+            let q = MLX.quantized(dense.asType(.float32), groupSize: 64, bits: bits)
+            w[n + qWq] = q.wq; w[n + qScales] = q.scales
+            if let b = q.biases { w[n + qBiases] = b }
+            eval([q.wq, q.scales] + (q.biases.map { [$0] } ?? []))
+            w[n] = nil
+        }
     }
 
     /// rotate_half RoPE (NeoX). Returns (cos, sin) as [T, headDim], fp32, built in Double.
@@ -181,9 +234,43 @@ public final class Qwen3Decoder {
     /// Absolute position of the NEXT token to be processed (= number of tokens already cached).
     public private(set) var offset: Int = 0
 
-    public init(weights: [String: MLXArray], config: Qwen3.Config = .init(), prefix: String = "transformer") {
-        self.w = weights; self.c = config; self.prefix = prefix
+    let options: Qwen3.GenOptions
+    /// Prepared projection weights (keyed by the full weight name) for the non-default weight modes.
+    private var dense: [String: MLXArray] = [:]
+    private var quant: [String: (wq: MLXArray, scales: MLXArray, biases: MLXArray?)] = [:]
+
+    public init(weights: [String: MLXArray], config: Qwen3.Config = .init(), prefix: String = "transformer",
+                options: Qwen3.GenOptions = .init()) {
+        self.w = weights; self.c = config; self.prefix = prefix; self.options = options
         self.caches = (0..<config.layers).map { _ in Qwen3KVCache() }
+        if options.weights != .castPerStep {
+            for n in Qwen3.projectionNames(config: config, prefix: prefix) {
+                if let wq = weights[n + Qwen3.qWq], let sc = weights[n + Qwen3.qScales] {
+                    quant[n] = (wq, sc, weights[n + Qwen3.qBiases])   // pre-quantized at load
+                    continue
+                }
+                let f = weights[n]!.asType(.float32)
+                switch options.weights {
+                case .fp32: dense[n] = f; eval(f)
+                case .int8, .int4:
+                    let q = MLX.quantized(f, groupSize: 64, bits: options.weights == .int8 ? 8 : 4)
+                    quant[n] = q; eval([q.wq, q.scales] + (q.biases.map { [$0] } ?? []))
+                case .castPerStep: break
+                }
+            }
+        }
+    }
+
+    /// `x @ Wᵀ` for a named projection, honoring the weight mode.
+    func proj(_ x: MLXArray, _ name: String) -> MLXArray {
+        switch options.weights {
+        case .castPerStep: return SkinOps.linear(x, Qwen3.fp(w[name]!))
+        case .fp32: return SkinOps.linear(x, dense[name]!)
+        case .int8, .int4:
+            let q = quant[name]!
+            return quantizedMatmul(x, q.wq, scales: q.scales, biases: q.biases, transpose: true,
+                                   groupSize: 64, bits: options.weights == .int8 ? 8 : 4)
+        }
     }
 
     /// Reorder every layer's KV cache along the beam axis (beam-search graft).
@@ -213,9 +300,9 @@ public final class Qwen3Decoder {
         for i in 0..<c.layers {
             let lp = "\(prefix).model.layers.\(i)"
             let hn = SkinOps.rmsNorm(h, w["\(lp).input_layernorm.weight"]!, eps: c.rmsEps)
-            var q = SkinOps.linear(hn, Qwen3.fp(w["\(lp).self_attn.q_proj.weight"]!))
-            var k = SkinOps.linear(hn, Qwen3.fp(w["\(lp).self_attn.k_proj.weight"]!))
-            var v = SkinOps.linear(hn, Qwen3.fp(w["\(lp).self_attn.v_proj.weight"]!))
+            var q = proj(hn, "\(lp).self_attn.q_proj.weight")
+            var k = proj(hn, "\(lp).self_attn.k_proj.weight")
+            var v = proj(hn, "\(lp).self_attn.v_proj.weight")
             q = q.reshaped([B, Tq, c.heads, c.headDim])
             k = k.reshaped([B, Tq, c.kvHeads, c.headDim])
             v = v.reshaped([B, Tq, c.kvHeads, c.headDim])
@@ -227,19 +314,26 @@ public final class Qwen3Decoder {
             q = Qwen3.applyRope(q, cosT, sinT)
             k = Qwen3.applyRope(k, cosT, sinT)
             let (fullK, fullV) = caches[i].update(k.asType(c.kvDtype), v.asType(c.kvDtype))  // stored kvDtype
-            let kk = Qwen3.repeatKV(fullK, rep: rep).asType(.float32)  // upcast for fp32 compute
-            let vv = Qwen3.repeatKV(fullV, rep: rep).asType(.float32)
-            var att = matmul(q, kk.swappedAxes(-1, -2)) * scale  // [B,heads,Tq,Tcache]
-            if let m4 = mask4 { att = att + m4 }
-            att = softmax(att, axis: -1)
-            let o = matmul(att, vv)                       // [B,heads,Tq,Dh]
+            let o: MLXArray
+            if options.fusedAttention {
+                // native GQA: [B,heads,Tq,Dh] queries over [B,kv,T,Dh] keys — no repeat copy.
+                o = MLXFast.scaledDotProductAttention(queries: q, keys: fullK.asType(.float32),
+                                                      values: fullV.asType(.float32), scale: scale, mask: mask4)
+            } else {
+                let kk = Qwen3.repeatKV(fullK, rep: rep).asType(.float32)  // upcast for fp32 compute
+                let vv = Qwen3.repeatKV(fullV, rep: rep).asType(.float32)
+                var att = matmul(q, kk.swappedAxes(-1, -2)) * scale  // [B,heads,Tq,Tcache]
+                if let m4 = mask4 { att = att + m4 }
+                att = softmax(att, axis: -1)
+                o = matmul(att, vv)                       // [B,heads,Tq,Dh]
+            }
             let merged = SkinOps.mergeHeads(o)            // [B,Tq,heads*Dh]
-            let attnOut = SkinOps.linear(merged, Qwen3.fp(w["\(lp).self_attn.o_proj.weight"]!))
+            let attnOut = proj(merged, "\(lp).self_attn.o_proj.weight")
             h = h + attnOut
             let hn2 = SkinOps.rmsNorm(h, w["\(lp).post_attention_layernorm.weight"]!, eps: c.rmsEps)
-            let gate = SkinOps.linear(hn2, Qwen3.fp(w["\(lp).mlp.gate_proj.weight"]!))
-            let up = SkinOps.linear(hn2, Qwen3.fp(w["\(lp).mlp.up_proj.weight"]!))
-            let mlp = SkinOps.linear(silu(gate) * up, Qwen3.fp(w["\(lp).mlp.down_proj.weight"]!))
+            let gate = proj(hn2, "\(lp).mlp.gate_proj.weight")
+            let up = proj(hn2, "\(lp).mlp.up_proj.weight")
+            let mlp = proj(silu(gate) * up, "\(lp).mlp.down_proj.weight")
             h = h + mlp
         }
         offset += Tq
@@ -249,7 +343,7 @@ public final class Qwen3Decoder {
     /// Final-norm + un-tied head → logits `[B, Tq, vocab]`.
     func logits(_ h: MLXArray) -> MLXArray {
         let hn = SkinOps.rmsNorm(h, w["\(prefix).model.norm.weight"]!, eps: c.rmsEps)
-        return SkinOps.linear(hn, Qwen3.fp(w["\(prefix).lm_head.weight"]!))
+        return proj(hn, "\(prefix).lm_head.weight")
     }
 
     /// Prefill the prompt embeddings `[B, Tprompt, hidden]`; returns logits at every prompt position.

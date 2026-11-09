@@ -11,8 +11,13 @@ public enum SkinTokensPipeline {
     public struct Params: Sendable {
         public var numBeams = 10
         public var maxNewTokens = 2040
-        public init(numBeams: Int = 10, maxNewTokens: Int = 2040) {
-            self.numBeams = numBeams; self.maxNewTokens = maxNewTokens
+        /// Generation decoder options. Default (v0.2.0): bf16 weights + fused SDPA attention — 27–33%
+        /// faster per step than the explicit attention, output-equivalent on in-distribution meshes
+        /// (AB-R-0812). Pass `.int8` weights for the quantized tier (weights pre-quantized at load).
+        public var gen: Qwen3.GenOptions = Params.defaultGen
+        public static let defaultGen = Qwen3.GenOptions(weights: .castPerStep, fusedAttention: true)
+        public init(numBeams: Int = 10, maxNewTokens: Int = 2040, gen: Qwen3.GenOptions = Params.defaultGen) {
+            self.numBeams = numBeams; self.maxNewTokens = maxNewTokens; self.gen = gen
         }
     }
 
@@ -103,7 +108,7 @@ public enum SkinTokensPipeline {
         let (meshCond, condLat, condKvPts) = encode(cloud, weights: w)
         try checkpoint()
         var p = SkinGen.Params(); p.numBeams = params.numBeams; p.maxNewTokens = params.maxNewTokens
-        let dec = Qwen3Decoder(weights: w, config: genConfig)
+        let dec = Qwen3Decoder(weights: w, config: genConfig, options: params.gen)
         let res = try SkinGen.generate(decoder: dec, meshCond: meshCond, startTokens: [L.bos, L.clsTokens[2]],  // articulation
                                        layout: L, tokensPerSkin: 4, params: p) { s, _, _ in progress?(s); try checkpoint() }
         try checkpoint()
@@ -151,7 +156,7 @@ public enum SkinTokensPipeline {
         let prefix = SkinDetokenize.tokenize(joints: cJoints, parents: cParents, cls: clsTok, layout: L)
         let Jin = (try? SkinTokenGrammar.bonesInSequence(prefix + [L.lmEos], layout: L)) ?? cJoints.count
         var p = SkinGen.Params(); p.numBeams = params.numBeams; p.maxNewTokens = Jin * 4 + 8
-        let dec = Qwen3Decoder(weights: w, config: genConfig)
+        let dec = Qwen3Decoder(weights: w, config: genConfig, options: params.gen)
         let res = try SkinGen.generate(decoder: dec, meshCond: meshCond, startTokens: prefix, layout: L, tokensPerSkin: 4, params: p) { s, _, _ in progress?(s); try checkpoint() }
         try checkpoint()
         let ids = res.outputIds
@@ -214,7 +219,7 @@ public enum SkinTokensPipeline {
         let prefix = SkinDetokenize.tokenize(joints: cNormJoints, parents: cParents, cls: clsTok, layout: L)
         let Jin = (try? SkinTokenGrammar.bonesInSequence(prefix + [L.lmEos], layout: L)) ?? cNormJoints.count
         var p = SkinGen.Params(); p.numBeams = params.numBeams; p.maxNewTokens = Jin * 4 + 8
-        let dec = Qwen3Decoder(weights: w, config: genConfig)
+        let dec = Qwen3Decoder(weights: w, config: genConfig, options: params.gen)
         let res = try SkinGen.generate(decoder: dec, meshCond: meshCond, startTokens: prefix, layout: L, tokensPerSkin: 4, params: p) { s, _, _ in progress?(s); try checkpoint() }
         try checkpoint()
         let ids = res.outputIds

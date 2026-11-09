@@ -7,6 +7,9 @@ import SkinTokensRig
 /// Runtime errors for the SkinTokens `meshRig` package.
 public enum SkinTokensPackageError: Error, Sendable {
     case weightsNotFound(String)
+    /// Only `.bf16` (default) and `.int8` are supported. int4 was measured and rejected: it reassigns
+    /// ~27% of vertices to a different bone (AB-R-0812).
+    case unsupportedQuant(Quant)
 }
 
 /// MLXToolKit `ModelPackage` conformer for SkinTokens mesh auto-rigging (`meshRig`, contract 1.19.0).
@@ -40,7 +43,15 @@ public final class SkinTokensPackage: ModelPackage {
                 // transient); (3) **bf16 KV cache** (halves the ~2.75 GB beam cache — the biggest lever;
                 // `Qwen3.Config.kvDtype`, compute stays fp32, generation is non-parity so safe). Net
                 // 8.21 → 4.08 GB (50%). Further (unimplemented): fewer beams for skinOnly (fixed skeleton).
+                //
+                // v0.2.0 re-measure (2026-11-09, M5 Max, Release, fused SDPA default — AB-R-0812):
+                // bf16 resident 1.19 GB; int8 resident 0.83 GB (backbone quantized at load, dense
+                // originals dropped). Activations are identical across tiers on the same workload
+                // (VRM 2.42 GB either way); the longest sequence measured — 210k-vert TRELLIS cap, auto,
+                // 1,731 steps — peaked at 3.97 GB activation. 4.2 GB stays the declared max for both.
                 footprints: [QuantFootprint(quant: .bf16, residentBytes: 1_200_000_000,
+                                            peakActivationBytes: 4_200_000_000),
+                             QuantFootprint(quant: .int8, residentBytes: 850_000_000,
                                             peakActivationBytes: 4_200_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
@@ -53,6 +64,9 @@ public final class SkinTokensPackage: ModelPackage {
                        + "provided/embedded skeleton (skinOnly — the VRM companion-character path).",
                 modes: [MeshRigContract.auto, MeshRigContract.skinOnly])])
     }
+
+    /// Quant tiers this package can load (each has a declared `QuantFootprint`).
+    public nonisolated static let supportedQuants: Set<Quant> = [.bf16, .int8]
 
     private let configuration: Configuration
     private var weights: [String: MLXArray]?     // host-owned lifecycle; no global singleton (C13)
@@ -71,8 +85,18 @@ public final class SkinTokensPackage: ModelPackage {
             let missing = configuration.missingWeightSources(storeRoot: root)
             if !missing.isEmpty { try await WeightMaterializer.materialize(missing, into: root) }
         }
+        guard Self.supportedQuants.contains(configuration.quant) else {
+            throw SkinTokensPackageError.unsupportedQuant(configuration.quant)
+        }
         let path = try Self.resolve("tokenrig.safetensors", root: root, override: override)
-        weights = try Weights.load(path)   // CPU-stream load (Metal-watchdog rule)
+        var w = try Weights.load(path)   // CPU-stream load (Metal-watchdog rule)
+        if configuration.quant == .int8 {
+            // Quantize the Qwen3 backbone projections from the bf16 snapshot and drop the dense
+            // originals — one weight source on the Hub, no separate -8bit repo (AB-R-0812).
+            Qwen3.prequantize(&w, bits: 8)
+            MLX.Memory.clearCache()
+        }
+        weights = w
     }
 
     public func unload() async { weights = nil; MLX.Memory.clearCache() }
@@ -96,8 +120,11 @@ public final class SkinTokensPackage: ModelPackage {
         // is lane-ready — a future explicit-skeleton path merges it before rigging).
         // CAN cadence: `checkpoint` fires every generation step (per token) + at stage seams. The
         // rethrown CancellationError unwinds unchanged so the engine classifies user-cancel vs preempt.
+        var params = SkinTokensPipeline.Params()
+        if configuration.quant == .int8 { params.gen.weights = .int8 }
         let riggedGLB = try SkinTokensPipeline.rig(glbData: req.mesh.data, skinOnly: skinOnly, cls: cls,
-                                                   weights: w, checkpoint: { try Task.checkCancellation() })
+                                                   weights: w, params: params,
+                                                   checkpoint: { try Task.checkCancellation() })
 
         // CAN: a mid-run cancellation surfaces here (the generate loop already returned); rethrow before
         // materializing the response so the engine classifies it as a user cancel, not a result.
