@@ -3,11 +3,9 @@ import MLXToolKit
 
 /// Init-time configuration (C9) for the SkinTokens mesh auto-rigging package.
 ///
-/// **P1 status:** this is the born-clean *contract shell* — `PackageConfiguration` + `ModelStorable`
-/// + `QuantConfigured` + `WeightSourcing` + `WeightPrewarming`, all capability-agnostic, so it
-/// compiles + passes the offline MAT-1..5 gate against the published mlx-engine-swift 0.27.0. The
-/// `meshRig` `ModelPackage` conformer (manifest, `run()`, C0–C13, CAN) lands at S7 when `meshRig`
-/// is added to the engine contract (a versioned core change). See ../../SkinTokensDev/PORTING-SPEC.md.
+/// `PackageConfiguration` + `ModelStorable` + `QuantConfigured` + `WeightSourcing` +
+/// `WeightPrewarming`, consumed by the `meshRig` `SkinTokensPackage` conformer. Passes the offline
+/// MAT-1..5 gate (MaterializationTests).
 public struct SkinTokensConfiguration: PackageConfiguration, ModelStorable, QuantConfigured {
     public var weightsRepo: String
     public var revision: String?
@@ -70,7 +68,8 @@ extension SkinTokensConfiguration: WeightSourcing {
     }
 
     /// Explicit `weightsRootOverride` first (flat `<dir>/<file>` or `<dir>/<org>/<name>/<file>`), then
-    /// the ModelStore layout (`<root>/xocialize/skintokens-mlx`). The real HF cache stays a load()-time
+    /// the ModelStore repo folder (`<root>/models--mlx-community--SkinTokens-bf16/`, files flat — the
+    /// materializer copies the snapshot there). The real HF cache stays a load()-time
     /// fallback only, so the fresh-machine posture (MAT-4) stays honest.
     public func missingWeightSources(storeRoot: URL?) -> [WeightSource] {
         if let dir = weightsRootOverride,

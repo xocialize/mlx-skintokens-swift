@@ -1,9 +1,9 @@
 // WeightMaterializer.swift — first-run download of the package's declared weight sources (the
 // auto-materialization contract: the PACKAGE materializes, the app only picks the models folder).
 // Same shape as the MLXLTX2 / Trellis2 reference implementations: each missing source's repo is
-// snapshot-downloaded into the engine ModelStore layout (`<root>/<org>/<name>/…`) via
+// snapshot-downloaded into the engine ModelStore repo folder (`<root>/models--<org>--<name>/`, files copied flat) via
 // swift-huggingface's HubClient, with per-file progress forwarded to `WeightDownloadProgress` so the
-// engine's PreparationMonitor surfaces `.downloading`. The SkinTokens repo (`xocialize/skintokens-mlx`)
+// engine's PreparationMonitor surfaces `.downloading`. The SkinTokens repo (`mlx-community/SkinTokens-bf16`)
 // is public — no HF_TOKEN needed (HubClient still honors one if present).
 
 import Foundation

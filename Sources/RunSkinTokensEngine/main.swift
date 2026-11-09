@@ -17,6 +17,8 @@ import SkinTokensKit
 //   MODE        "auto" (default) or "skinOnly" (the VRM companion path)
 //   CLS         cls conditioning ("vroid" default for skinOnly)
 //   WEIGHTS_DIR weights root override (e.g. the local converted/ dir for pre-upload validation)
+//   MODELS_ROOT engine model-store root (`engine.useModelStore`) — the app's path: prepare()
+//               materializes mlx-community/SkinTokens-bf16 there on first run
 
 setvbuf(stdout, nil, _IONBF, 0)
 
@@ -31,11 +33,13 @@ let modeStr = env["MODE"] ?? "auto"
 let mode: Mode = modeStr == "skinOnly" ? MeshRigContract.skinOnly : MeshRigContract.auto
 let cls = env["CLS"]
 let weightsOverride = env["WEIGHTS_DIR"].map { URL(fileURLWithPath: $0) }
+let modelsRoot = env["MODELS_ROOT"].map { URL(fileURLWithPath: $0, isDirectory: true) }
 
 print("================ SkinTokens meshRig · ENGINE-DRIVEN e2e ================")
 print("[engine] input: \(inGLB) (\(glbData.count) bytes) | mode=\(mode.rawValue) cls=\(cls ?? "-")")
 
 let engine = MLXServeEngine()
+if let modelsRoot { await engine.useModelStore(ModelStore(root: modelsRoot)) }
 print("[engine] device budget: \(gb(await engine.memory.budgetBytes)) | available \(gb(await engine.memory.availableBytes))")
 
 do {

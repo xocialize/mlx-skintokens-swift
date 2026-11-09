@@ -13,10 +13,9 @@ import PackageDescription
 //   captures (captures/{giraffe,humanoid}_beam1_s0/*.npy) and matching the deterministic stages,
 //   NOT by seed-matching (P0 proved CPU generation is non-reproducible under a fixed seed).
 //
-// SkinTokensKit: the MLXToolKit layer. P1 ships the compiling Configuration + WeightSourcing shell
-//   (born MAT-clean); the full `meshRig` ModelPackage conformer + C0–C13 / CAN gates land at S7 —
-//   `meshRig` is a net-new engine capability (contract bump), deferred so P1 builds against the
-//   published mlx-engine-swift 0.27.0 (which has no `meshRig` case). See ../SkinTokensDev/PORTING-SPEC.md.
+// SkinTokensKit: the MLXToolKit layer — the `meshRig` `ModelPackage` conformer (SkinTokensPackage),
+//   its WeightSourcing/MAT configuration, and first-run weight materialization. Offline C0–C13 +
+//   CAN-1..3 + MAT-1..5 run under `swift test`.
 let package = Package(
     name: "mlx-skintokens-swift",
     platforms: [.macOS("26.0")],   // MLXToolKit (engine contract) floor
@@ -27,11 +26,13 @@ let package = Package(
         .library(name: "SkinTokensKit", targets: ["SkinTokensKit"]),
     ],
     dependencies: [
-        // `from:` (fleet pattern) — engine ≥0.27.0 pairs with mlx-swift ≥0.31.4.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.31.4"),
-        // MLXEngine contract + coordinator. `meshRig` (contract 1.19.0) landed on main + tagged
-        // v0.30.0 (2026-07-10), so back on the URL `from:` pin — the S7 dev worktree override is gone.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.30.0"),
+        // mlx-swift comes through the fleet's pinned fork (AB-D-0208: upstream 0.32.3 + the
+        // _updateInternal leak fix). Must be the SAME URL the engine uses, or SPM sees two
+        // `mlx-swift` identities and refuses to resolve.
+        .package(url: "https://github.com/xocialize/mlx-swift", from: "0.32.4"),
+        // MLXEngine contract + coordinator. `meshRig` landed in contract 1.19.0 (engine v0.30.0);
+        // re-floored on the current engine for the PROD promotion.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.76.0"),
         // First-run auto-materialization (MAT gate): HubClient snapshot download of VAST-AI/SkinTokens
         // (once converted to safetensors) into the engine ModelStore layout.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -61,8 +62,8 @@ let package = Package(
             // reference VRoid — the Route-B template fitted onto bare generated meshes.
             .copy("Resources/vroid-template.json"),
         ]),
-        // The MLXToolKit layer. P1: Configuration + WeightSourcing/ModelStorable/QuantConfigured
-        // (born MAT-clean) + GLB I/O. The `meshRig` ModelPackage conformer defers to S7.
+        // The MLXToolKit layer: the `meshRig` ModelPackage conformer + Configuration
+        // (WeightSourcing/ModelStorable/QuantConfigured) + first-run weight materialization.
         .target(name: "SkinTokensKit", dependencies: [
             "SkinTokensCore",
             "SkinTokensRig",
@@ -78,16 +79,16 @@ let package = Package(
             "SkinTokensRig",
             .product(name: "MLX", package: "mlx-swift"),
         ]),
-        // Engine-driven GPU e2e CLI (Stage-2 step 7): drives the package THROUGH MLXServeEngine.
-        // Placeholder until the S7 `meshRig` conformer exists.
+        // Engine-driven GPU e2e CLI: drives the package THROUGH MLXServeEngine
+        // (register → prepare → run); MODELS_ROOT exercises first-run materialization.
         .executableTarget(name: "RunSkinTokensEngine", dependencies: [
             "SkinTokensKit",
             .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             .product(name: "MLXToolKit", package: "mlx-engine-swift"),
             .product(name: "MLX", package: "mlx-swift"),
         ]),
-        // Offline conformance suite (MAT-1..5 on the Configuration + Core structural tests — no MLX
-        // kernels, no weights; safe under `swift test`). C0–C13 + CAN land at S7 with the conformer.
+        // Offline conformance suite (C0–C13 + CAN-1..3 + MAT-1..5 + Core structural tests — no MLX
+        // kernels, no weights; safe under `swift test`).
         .testTarget(name: "SkinTokensKitTests", dependencies: [
             "SkinTokensKit",
             "SkinTokensCore",

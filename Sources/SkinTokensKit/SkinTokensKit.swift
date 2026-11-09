@@ -12,7 +12,7 @@ import Foundation
 ///     checkpoint first, per-token checkpoints in the beam loop), C0–C13 + CAN-1..3 gates.
 ///   • `GLBIO` — original-glTF parse (verts/faces/normals/UVs) + in-place JOINTS_0/WEIGHTS_0 +
 ///     skeleton-node injection, preserving buffers/materials/UVs (S4; Trellis2 GLBEncoder heritage).
-///   • `WeightMaterializer` — HubClient snapshot download of `xocialize/skintokens-mlx` (S7).
+///   • `WeightMaterializer` — HubClient snapshot download of `mlx-community/SkinTokens-bf16` (S7).
 ///
 /// See ../../SkinTokensDev/PORTING-SPEC.md (phase table) and HANDOFF.md.
 public enum SkinTokensKit {

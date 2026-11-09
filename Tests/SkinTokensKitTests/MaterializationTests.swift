@@ -41,9 +41,11 @@ final class MaterializationTests: XCTestCase {
         XCTAssertTrue(report.passed, report.summary)
     }
 
-    /// The materializer's own destination (`<root>/xocialize/skintokens-mlx`) reads back as present.
+    /// The materializer's own destination — the engine ModelStore's HF-cache-named repo folder
+    /// (`<root>/models--mlx-community--SkinTokens-bf16`, contract ≥1.22.0 / MS-1) — reads back as present.
     func testStoreLayoutSatisfies() throws {
-        let (_, root) = try stagedSnapshotDir(subpath: SkinTokensConfiguration.consolidatedRepo)
+        let (_, root) = try stagedSnapshotDir(
+            subpath: ModelStore.repoFolderName(for: SkinTokensConfiguration.consolidatedRepo))
         defer { try? FileManager.default.removeItem(at: root) }
         let cfg = SkinTokensConfiguration()
         XCTAssertTrue(cfg.missingWeightSources(storeRoot: root).isEmpty,
@@ -75,7 +77,7 @@ final class MaterializationTests: XCTestCase {
         let storeResolved = SkinTokensConfiguration(modelsRootDirectory: root)
         XCTAssertEqual(storeResolved.prewarmPaths.count, 2)
         XCTAssertTrue(storeResolved.prewarmPaths[0].path.hasPrefix(
-            root.appending(path: SkinTokensConfiguration.consolidatedRepo).path))
+            root.appending(path: ModelStore.repoFolderName(for: SkinTokensConfiguration.consolidatedRepo)).path))
 
         let override = URL(fileURLWithPath: "/tmp/dev-weights")
         let overridden = SkinTokensConfiguration(modelsRootDirectory: root, weightsRootOverride: override)
